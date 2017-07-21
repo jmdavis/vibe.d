@@ -1869,24 +1869,14 @@ private void listenHTTPPlain(HTTPServerSettings settings, HTTPServerContext cont
 	enforce(any_successful, "Failed to listen for incoming HTTP connections on any of the supplied interfaces.");
 }
 
-private alias TLSStreamType = ReturnType!(createTLSStreamFL!(InterfaceProxy!Stream));
-
-
 private void handleHTTPConnection(TCPConnection connection, HTTPListenInfo listen_info)
 @safe {
-	InterfaceProxy!Stream http_stream;
-	http_stream = connection;
-
 	// Set NODELAY to true, to avoid delays caused by sending the response
 	// header and body in separate chunks. Note that to avoid other performance
 	// issues (caused by tiny packets), this requires using an output buffer in
 	// the event driver, which is the case at least for the default libevent
 	// based driver.
 	connection.tcpNoDelay = true;
-
-	version(HaveNoTLS) {} else {
-		TLSStreamType tls_stream;
-	}
 
 	if (!connection.waitForData(10.seconds())) {
 		logDebug("Client didn't send the initial request in a timely manner. Closing connection.");
@@ -1899,11 +1889,17 @@ private void handleHTTPConnection(TCPConnection connection, HTTPListenInfo liste
 		else {
 			logDebug("Accept TLS connection: %s", listen_info.tlsContext.kind);
 			// TODO: reverse DNS lookup for peer_name of the incoming connection for TLS client certificate verification purposes
-			tls_stream = createTLSStreamFL(http_stream, listen_info.tlsContext, TLSStreamState.accepting, null, connection.remoteAddress);
-			http_stream = tls_stream;
+			auto tls_stream = createTLSStreamFL(connection, listen_info.tlsContext, TLSStreamState.accepting, null, connection.remoteAddress);
+			handleHTTPConnection(tls_stream, connection, listen_info);
 		}
+	} else {
+		handleHTTPConnection(connection, connection, listen_info);
 	}
+}
 
+private void handleHTTPConnection(Stream)(Stream http_stream, TCPConnection connection, HTTPListenInfo listen_info) @safe
+	if (isStream!Stream)
+{
 	while (!connection.empty) {
 		HTTPServerSettings settings;
 		bool keep_alive;
@@ -1933,8 +1929,9 @@ private void handleHTTPConnection(TCPConnection connection, HTTPListenInfo liste
 	connection.close();
 }
 
-private bool handleRequest(InterfaceProxy!Stream http_stream, TCPConnection tcp_connection, HTTPListenInfo listen_info, ref HTTPServerSettings settings, ref bool keep_alive, scope IAllocator request_allocator)
-@safe {
+private bool handleRequest(Stream)(Stream http_stream, TCPConnection tcp_connection, HTTPListenInfo listen_info, ref HTTPServerSettings settings, ref bool keep_alive, scope IAllocator request_allocator) @safe
+	if (isStream!Stream)
+{
 	import std.algorithm.searching : canFind;
 
 	SysTime reqtime = Clock.currTime(UTC());
@@ -1979,15 +1976,14 @@ private bool handleRequest(InterfaceProxy!Stream http_stream, TCPConnection tcp_
 
 	// Create the response object
 	InterfaceProxy!ConnectionStream cproxy = tcp_connection;
-	auto res = FreeListRef!HTTPServerResponse(http_stream, cproxy, settings, request_allocator/*.Scoped_payload*/);
+	InterfaceProxy!(.Stream) hproxy = http_stream;
+	auto res = FreeListRef!HTTPServerResponse(hproxy, cproxy, settings, request_allocator/*.Scoped_payload*/);
 	req.tls = res.m_tls = listen_info.tlsContext !is null;
 	if (req.tls) {
 		version (HaveNoTLS) assert(false);
 		else {
-			static if (is(InterfaceProxy!ConnectionStream == ConnectionStream))
-				req.clientCertificate = (cast(TLSStream)http_stream).peerCertificate;
-			else
-				req.clientCertificate = http_stream.extract!TLSStreamType.peerCertificate;
+			static if (is(typeof(http_stream.peerCertificate)))
+				req.clientCertificate = http_stream.peerCertificate;
 		}
 	}
 
@@ -2203,7 +2199,7 @@ private bool handleRequest(InterfaceProxy!Stream http_stream, TCPConnection tcp_
 private void parseRequestHeader(InputStream)(HTTPServerRequest req, InputStream http_stream, IAllocator alloc, ulong max_header_size)
 	if (isInputStream!InputStream)
 {
-	auto stream = FreeListRef!LimitedHTTPInputStream(http_stream, max_header_size);
+	scope stream = new LimitedHTTPInputStream(http_stream, max_header_size);
 
 	logTrace("HTTP server reading status line");
 	auto reqln = () @trusted { return cast(string)stream.readLine(MaxHTTPHeaderLineLength, "\r\n", alloc); }();
